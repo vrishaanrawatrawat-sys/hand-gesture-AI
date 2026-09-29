@@ -181,7 +181,13 @@ class CameraWorker(threading.Thread):
         try:
             import cv2
             import mediapipe as mp
-            cap = cv2.VideoCapture(self.config["camera"])
+            # macOS camera capture is provided by AVFoundation. Selecting it
+            # explicitly avoids OpenCV choosing an unavailable backend in a
+            # frozen .app bundle.
+            if platform.system() == "Darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
+                cap = cv2.VideoCapture(self.config["camera"], cv2.CAP_AVFOUNDATION)
+            else:
+                cap = cv2.VideoCapture(self.config["camera"])
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config["width"])
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config["height"])
             if not cap.isOpened():
@@ -744,7 +750,8 @@ class GestureApp(tk.Tk):
     @staticmethod
     def _permission_message(detail):
         if platform.system() == "Darwin":
-            return ("macOS may require permissions for keyboard and mouse control. Open System Settings → Privacy & Security → Accessibility and enable the terminal or Python used to run this app. Also allow camera access under Privacy & Security → Camera.\n\n" + detail)
+            return ("Hand Gesture AI needs Camera access to recognize gestures. Enable it under System Settings → Privacy & Security → Camera.\n\n"
+                    "To send gesture shortcuts or mouse actions, enable Hand Gesture AI under Privacy & Security → Accessibility. To record shortcuts globally, also enable it under Privacy & Security → Input Monitoring. Quit and reopen the app after changing permissions.\n\n" + detail)
         return "Keyboard or mouse control could not be initialized. Check that the pynput dependency is installed and that security software permits input control.\n\n" + detail
 
     def _poll(self):
