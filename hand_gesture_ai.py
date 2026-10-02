@@ -1,6 +1,6 @@
 """Standalone, cross-platform hand gesture control desktop application.
 
-Install dependencies with: python -m pip install opencv-python mediapipe pynput pillow
+Install dependencies with: python -m pip install -r requirements.txt
 Run with: python hand_gesture_ai.py
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ GESTURES = ("Open Palm", "Fist", "Point", "Peace", "Three Fingers", "Four Finger
 MODIFIERS = {"ctrl": "CTRL", "alt": "ALT", "shift": "SHIFT", "cmd": "CMD", "win": "CMD"}
 DEFAULTS = {
     "Open Palm": {"type": "keyboard", "keys": ["SPACE"]},
-    "Fist": {"type": "keyboard", "keys": ["CTRL", "S"]},
+    "Fist": {"type": "keyboard", "keys": ["CMD" if platform.system() == "Darwin" else "CTRL", "S"]},
     "Point": {"type": "keyboard", "keys": ["F"]},
     "Peace": {"type": "keyboard", "keys": ["CTRL", "SHIFT", "P"]},
     "Three Fingers": {"type": "none"}, "Four Fingers": {"type": "none"},
@@ -54,14 +54,19 @@ def load_config(path: Path = CONFIG_PATH) -> tuple[dict, str | None]:
         if not isinstance(incoming, dict):
             raise ValueError("The configuration root must be an object")
         for key in ("camera", "width", "height", "stable_frames"):
-            if key in incoming and isinstance(incoming[key], int) and incoming[key] >= 0:
+            if key in incoming and isinstance(incoming[key], int) and incoming[key] >= (0 if key == "camera" else 1):
                 config[key] = incoming[key]
         for key in ("detection", "tracking", "cooldown", "swipe_sensitivity"):
-            if key in incoming and isinstance(incoming[key], (int, float)):
+            if key in incoming and isinstance(incoming[key], (int, float)) and math.isfinite(incoming[key]):
                 config[key] = max(0.0, min(float(incoming[key]), 1.0 if key in ("detection", "tracking") else 10.0))
+        if config["swipe_sensitivity"] <= 0:
+            config["swipe_sensitivity"] = .16
         for key in ("mirror", "landmarks", "show_fps"):
             if key in incoming and isinstance(incoming[key], bool): config[key] = incoming[key]
-        for name, action in incoming.get("bindings", {}).items():
+        bindings = incoming.get("bindings", {})
+        if not isinstance(bindings, dict):
+            raise ValueError("Bindings must be an object")
+        for name, action in bindings.items():
             if name in GESTURES and isinstance(action, dict) and action.get("type") in ("keyboard", "mouse", "none"):
                 if action["type"] == "keyboard" and isinstance(action.get("keys"), list) and action["keys"]:
                     config["bindings"][name] = {"type": "keyboard", "keys": [str(k).upper() for k in action["keys"]]}
@@ -108,7 +113,8 @@ def classify_gesture(points: list[tuple[float, float, float]]) -> tuple[str, flo
     # Thumb direction is measured against the palm axis, independent of image size.
     if thumb_extended and count == 0:
         dy = points[4][1] - points[2][1]
-        return ("Thumbs Up" if dy < -palm * .15 else "Thumbs Down"), .78
+        if abs(dy) > palm * .15:
+            return ("Thumbs Up" if dy < 0 else "Thumbs Down"), .78
     return "Unknown", .35
 
 
@@ -118,7 +124,7 @@ class SwipeDetector:
         self.samples: deque = deque()
 
     def update(self, center: tuple[float, float], now: float | None = None) -> str | None:
-        now = now or time.monotonic()
+        now = time.monotonic() if now is None else now
         self.samples.append((now, center))
         while self.samples and now - self.samples[0][0] > self.window: self.samples.popleft()
         if len(self.samples) < 3: return None
@@ -181,6 +187,8 @@ class CameraWorker(threading.Thread):
         try:
             import cv2
             import mediapipe as mp
+            if not hasattr(mp, "solutions"):
+                raise RuntimeError("Incompatible MediaPipe. Install requirements.txt using Python 3.9–3.12.")
             cap = cv2.VideoCapture(self.config["camera"])
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config["width"])
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config["height"])
@@ -188,7 +196,7 @@ class CameraWorker(threading.Thread):
                 self.events.put(("error", f"Camera {self.config['camera']} could not be opened. Check camera permissions or choose another camera.")); return
             self.events.put(("status", "Camera connected · MediaPipe ready"))
             hands_api = mp.solutions.hands
-            with hands_api.Hands(static_image_mode=False, max_num_hands=2,
+            with hands_api.Hands(static_image_mode=False, max_num_hands=1,
                     min_detection_confidence=self.config["detection"], min_tracking_confidence=self.config["tracking"]) as hands:
                 swipe = SwipeDetector(self.config["swipe_sensitivity"])
                 last = time.monotonic()
@@ -200,12 +208,14 @@ class CameraWorker(threading.Thread):
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     result = hands.process(rgb)
                     gesture, confidence, hand_name = "No hand", 0.0, "—"
+                    if not result.multi_hand_landmarks:
+                        swipe.samples.clear()
                     if result.multi_hand_landmarks:
                         for ix, landmarks in enumerate(result.multi_hand_landmarks):
                             points = [(p.x, p.y, p.z) for p in landmarks.landmark]
                             hand_name = result.multi_handedness[ix].classification[0].label if result.multi_handedness else "Hand"
                             candidate, score = classify_gesture(points)
-                            if candidate != "Unknown": gesture, confidence = candidate, score
+                            gesture, confidence = candidate, score
                             if self.config["landmarks"]: mp.solutions.drawing_utils.draw_landmarks(frame, landmarks, hands_api.HAND_CONNECTIONS)
                             motion = swipe.update((points[0][0], points[0][1]))
                             if motion: gesture, confidence = motion, .8
@@ -213,7 +223,7 @@ class CameraWorker(threading.Thread):
                     cv2.putText(frame, f"{gesture}  {confidence:.0%}", (15, 32), cv2.FONT_HERSHEY_SIMPLEX, .8, (60, 220, 120), 2)
                     if self.config["show_fps"]: cv2.putText(frame, f"{fps:.0f} FPS", (15, 62), cv2.FONT_HERSHEY_SIMPLEX, .6, (240, 240, 240), 2)
                     ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 78])
-                    if ok: self.events.put(("frame", (jpg.tobytes(), gesture, confidence, hand_name, fps)))
+                    if ok and self.events.qsize() < 2: self.events.put(("frame", (jpg.tobytes(), gesture, confidence, hand_name, fps)))
         except Exception as exc:
             log.exception("Camera/tracking failure")
             self.events.put(("error", f"Camera or hand tracking failed: {exc}"))
@@ -244,6 +254,7 @@ class GestureApp(tk.Tk):
         self._style(); self._build(); self._start_listener(); self.after(40, self._poll)
         self.bind("<Configure>", self._queue_responsive_layout)
         self.after_idle(self._apply_responsive_layout)
+        self.bind("<Escape>", lambda _event: self.emergency_stop())
         self.protocol("WM_DELETE_WINDOW", self.close)
         if warning: self.after(300, lambda: messagebox.showwarning("Settings recovered", warning))
 
@@ -569,16 +580,16 @@ class GestureApp(tk.Tk):
 
     def _key_press(self, key):
         if key == getattr(__import__('pynput').keyboard.Key, 'esc'):
-            self.after(0, self.emergency_stop)
+            self.events.put(("emergency", None))
         if self.recording is None: return
         name = self._normalize_key(key)
         if name:
             self.recording.add(name)
-            self.after(0, self._update_record_label)
+            self.events.put(("record_update", None))
 
     def _key_release(self, _key):
         if self.recording is not None:
-            self.after(0, self._finish_recording)
+            self.events.put(("record_finish", None))
 
     @staticmethod
     def _normalize_key(key):
@@ -683,12 +694,21 @@ class GestureApp(tk.Tk):
 
     def save_settings(self):
         try:
+            updated = dict(self.config_data)
             for key, (var, kind) in self.setting_vars.items():
-                self.config_data[key] = var.get() if kind == "bool" else (int(var.get()) if kind == "int" else float(var.get()))
-            if not 0 <= self.config_data["detection"] <= 1 or not 0 <= self.config_data["tracking"] <= 1: raise ValueError("Confidence values must be between 0 and 1.")
-            if self.config_data["stable_frames"] < 1 or self.config_data["cooldown"] < 0: raise ValueError("Stable frames must be positive and cooldown cannot be negative.")
-            self.save(); messagebox.showinfo("Settings saved", "Settings will apply next time the camera starts.")
-        except ValueError as exc: messagebox.showerror("Invalid setting", str(exc))
+                updated[key] = var.get() if kind == "bool" else (int(var.get()) if kind == "int" else float(var.get()))
+            if any(not math.isfinite(updated[key]) for key in ("detection", "tracking", "cooldown", "swipe_sensitivity")):
+                raise ValueError("Settings must be finite numbers.")
+            if not 0 <= updated["detection"] <= 1 or not 0 <= updated["tracking"] <= 1:
+                raise ValueError("Confidence values must be between 0 and 1.")
+            if updated["stable_frames"] < 1 or updated["cooldown"] < 0 or updated["swipe_sensitivity"] <= 0:
+                raise ValueError("Stable frames and swipe sensitivity must be positive; cooldown cannot be negative.")
+            if updated["camera"] < 0 or min(updated["width"], updated["height"]) < 1:
+                raise ValueError("Camera index must be nonnegative and dimensions must be positive.")
+            save_config(updated)
+            self.config_data = updated
+            messagebox.showinfo("Settings saved", "Settings will apply next time the camera starts.")
+        except (ValueError, tk.TclError, OSError) as exc: messagebox.showerror("Invalid setting", str(exc))
 
     def start_camera(self):
         if self.worker and self.worker.is_alive(): return
@@ -699,9 +719,12 @@ class GestureApp(tk.Tk):
             self.input = None
             self.status.set("Input permissions needed")
             messagebox.showwarning("Input control unavailable", self._permission_message(str(exc)))
+        self.events = queue.Queue()
+        self.stable_name, self.stable_count, self.fired_gesture = None, 0, None
         self.stop_event.clear(); self.worker = CameraWorker(dict(self.config_data), self.events, self.stop_event); self.worker.start(); self.status.set("Starting camera…")
 
     def stop_camera(self):
+        self.emergency_stop()
         self.stop_event.set(); self.status.set("Stopping camera…"); self.preview.configure(image="", text="Camera stopped\n\nPress START to connect")
 
     def toggle_control(self):
@@ -749,11 +772,15 @@ class GestureApp(tk.Tk):
 
     def _poll(self):
         try:
-            while True:
+            for _ in range(8):
                 kind, data = self.events.get_nowait()
-                if kind == "status": self.status.set(data)
-                elif kind == "error": self.status.set("Camera error"); messagebox.showerror("Camera / tracking", data)
+                if kind == "emergency": self.emergency_stop()
+                elif kind == "record_update": self._update_record_label()
+                elif kind == "record_finish": self._finish_recording()
+                elif kind == "status": self.status.set(data)
+                elif kind == "error": self.emergency_stop(); self.status.set("Camera error"); messagebox.showerror("Camera / tracking", data)
                 elif kind == "frame":
+                    if self.stop_event.is_set(): continue
                     blob, gesture, confidence, hand, fps = data
                     try:
                         from PIL import Image, ImageTk
@@ -778,6 +805,7 @@ class GestureApp(tk.Tk):
     def close(self):
         self.emergency_stop(); self.stop_event.set()
         if self.listener: self.listener.stop()
+        if self.worker: self.worker.join(timeout=2)
         self.destroy()
 
 
@@ -785,5 +813,5 @@ if __name__ == "__main__":
     try: GestureApp().mainloop()
     except Exception as error:
         log.exception("Application could not start")
-        try: messagebox.showerror("Startup failed", f"{error}\n\nInstall dependencies with: python -m pip install opencv-python mediapipe pynput pillow")
+        try: messagebox.showerror("Startup failed", f"{error}\n\nInstall dependencies with: python -m pip install -r requirements.txt")
         except Exception: print(f"{APP_NAME} startup failed: {error}")

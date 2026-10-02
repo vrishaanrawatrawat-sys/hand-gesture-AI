@@ -1,0 +1,6 @@
+# MediaPipe Solutions API used by this app (Python 3.9–3.12).
+mediapipe==0.10.21
+numpy==1.26.4
+opencv-contrib-python==4.11.0.86
+pynput>=1.7.7,<2
+Pillow>=10.4,<12
